@@ -1,0 +1,375 @@
+from __future__ import division
+import itertools
+import _pickle as cPickle
+import datetime
+import hashlib
+import locale
+import numpy as np
+import pycountry
+import scipy.io as sio
+import scipy.sparse as ss
+import scipy.spatial.distance as ssd
+from collections import defaultdict
+from sklearn.preprocessing import normalize
+
+#忽略警告信息
+import warnings
+warnings.simplefilter("ignore")
+
+
+# 1.数据清洗
+class DataCleaner:
+    def __init__(self):
+        #载入locals
+        self.localeIdMap = defaultdict(int)#defaultdict给所有的key赋予默认value（0）
+        for i, l in enumerate(locale.locale_alias.keys()):
+            self.localeIdMap[l] = i + 1
+        #处理countries
+        self.countryIdMap = defaultdict(int)
+        ctryIdx = defaultdict(int)
+        for i, c in enumerate(pycountry.countries):
+            self.countryIdMap[c.name.lower()] = i + 1
+            if c.name.lower() == "usa":
+                ctryIdx["US"] = i
+            if c.name.lower() == "canada":
+                ctryIdx["CA"] == i
+        for cc in ctryIdx.keys():
+            for s in pycountry.subdivisions.get(country_code=cc):
+                self.countryIdMap[s.name.lower()] = ctryIdx[cc] + 1
+        # 处理性别
+        self.genderIdMap = defaultdict(int, {"male":1, "female":2})
+
+    def getLocaleId(self, locstr):
+        return self.localeIdMap[locstr.lowere()]
+
+
+    def getGenderId(self, genderStr):
+        return self.genderIdMap[genderStr]
+
+    def getJoinedYearMonth(self,dateString):
+        # 返回年月的时间
+        dttm = datetime.datetime.strptime(dateString,"%Y-%m-%dT%H:%M:%S.%fZ")
+        return "".join([str(dttm.year),str(dttm.month)])
+
+    def getCountryId(self,location):
+        if (isinstance(location, str)
+            and len(location.strip()) > 0
+            and location.rfind("  ") > -1):
+            return self.countryIdMap[location[location.rindex("  ") + 2:].lower()]
+        else:
+            return 0
+
+    def getBitrhYearInt(self,birthYear):
+        try:
+            return 0 if birthYear == "None" else int(birthYear)
+        except:
+            return 0
+
+    def getTimeZoneInt(self, timezone):
+        try:
+            return int(timezone)
+        except:
+            return 0
+
+    def getFeatureHash(self, value):
+        #hashlib是一个提供字符加密功能的模块，包含MD5和SHA的加密算法
+        # TypeError: Unicode-objects must be encoded before hashing
+        if len(value.strip()) == 0:
+            return -1
+        else:
+            return int(hashlib.sha224(str(value).encode('utf-8')).hexdigest()[0:4], 16)
+
+    def getFloatValue(self,value):
+        if len(value.strip()) == 0:
+            return 0.0
+        else:
+            return float(value)
+
+
+"""
+2.处理user和event关联数据
+(1)UniqueUsers:集合 统计train和test中不同的user
+(2)UniqueEvents 集合                     event
+(3)eventsForUser:{event:set(users)} 还是train和test中的
+(4)usersForEvents：{users：set（events）}各个event有多少不同user对其交互
+(5)userEvenScore :dol_matrix shape[len(uniqueUsers,uniqueEvents)]
+    train中各个user对event感兴趣程度
+(6)uniqueUserPairs:set() eventForUser每个event对应的user中 train test中对同一个event感兴趣的users的两两组合
+(7)uniqueEventPairs:set() train test 中被同一个user感兴趣的events的两两组合
+(8)userIndex: dict{user,i} uniqueUsers中user对应的序号
+(9)eventIndex： dict{event,i} uniqueEvents中event对其对应的序号
+"""
+class ProgramEntities:
+    #重点处理train和test中出现的user和event，重点处理这部分关联数据
+    def __init__(self):
+        #统计训练集有多少独立的用户的events
+        uniqueUsers = set()##统计users
+        uniqueEvents = set()##统计events
+        eventsForUser = defaultdict(set)##统计{event:set(users)}
+        usersForEvent  = defaultdict(set)##统计{user：set（event）}
+        for filename in ["train.csv", "test.csv"]:
+            f = open(filename,'rb')
+            f.readline().decode('utf-8').strip().split(",")#出现编码错误 rb为二进制只读
+            for line in f:
+                cols = line.decode('utf-8').strip().split(",")
+                uniqueUsers.add(cols[0])
+                uniqueEvents.add(cols[1])
+                eventsForUser[cols[0]].add(cols[1])
+                usersForEvent[cols[1]].add(cols[0])
+            f.close()
+        ##统计各个user对各个event感兴趣程度
+        self.userEventScores = ss.dok_matrix((len(uniqueUsers), len(uniqueEvents)))##采用字典来记录矩阵中不为0的元素
+        self.userIndex = dict()
+        self.eventIndex = dict()
+        for i, u in enumerate(uniqueUsers):
+            self.userIndex[u] = i
+        for i, e in enumerate(uniqueEvents):
+            self.eventIndex[e] = i
+        ftrain = open("train.csv",'rb')
+        ftrain.readline()
+        for line in ftrain:
+            cols = line.decode('utf-8').strip().split(",")
+            i = self.userIndex[cols[0]]
+            j = self.eventIndex[cols[1]]
+            ##统计train中各个user对各个event感兴趣程度，cols[4]为interest列[5]是notinterested列
+            self.userEventScores[i, j] = int(cols[4]) - int(cols[5])
+        ftrain.close()
+        sio.mmwrite("PE_userEventScores", self.userEventScores)
+        #关联用户指在同一个event上有行为的用户对
+        #关联event指至少有同一个user有行为的event对
+        self.uniqueUserPairs = set()
+        self.uniqueEventPairs = set()
+        for event in uniqueEvents:
+            users = usersForEvent[event]
+            if len(users) > 2:
+                ##itertools.combinations(users, 2)表示在users中随机抽取两个不同的user进行组合，然后更新到uniqueUserPairs。
+                self.uniqueEventPairs.update(itertools.combinations(users, 2))
+        for user in uniqueUsers:
+            events = eventsForUser[user]
+            if len(events) > 2:
+                self.uniqueEventPairs.update(itertools.combinations(events, 2))
+        cPickle.dump(self.userIndex, open("PE_userIndex.pkl",'wb'))
+        cPickle.dump(self.eventIndex, open("PE_eventIndex.pkl", 'wb'))
+
+"""
+3.用户相似度矩阵
+（1) userMatrix：dok_matrix shape[len(users),len(users.columns)-1]
+    出去id列的users表
+（2）userSimmatrix：dok_matrix shape[len(users),len(users)]
+    根据userMatrix计算欧氏距离判断user相似度（并且这两个user至少对同一个event发生行为）
+    得到用户相似度矩阵
+"""
+class Users:
+    ##构建user/users相似度矩阵
+    def __init__(self, programEntities, sim=ssd.correlation):
+        cleaner = DataCleaner()
+        nusers = len(programEntities.userIndex.keys())
+        fin = open("users.csv", 'rb')
+        # fin.readline().decode('utf-8').strip().split(",")
+        colnames = fin.readline().decode('utf-8').strip().split(",")
+        self.userMatrix = ss.dok_matrix((nusers,len(colnames) - 1))
+        for line in colnames:
+            cols = line.strip().split(",")
+            #只考虑train.csv中的用户
+            if cols[0] in programEntities.userIndex:# 更改 python3删除了has_key()方法
+            # if programEntities.userIndex.has_key(cols[0]):
+                i = programEntities.userIndex[cols[0]]
+                ##将数据预处理放进userMatrix矩阵中
+                self.userMatrix[i, 0] = cleaner.getLocaleId(cols[1])
+                self.userMatrix[i, 1] = cleaner.getBitrhYearInt(cols[2])
+                self.userMatrix[i, 2] = cleaner.getGenderId((cols[3]))
+                self.userMatrix[i, 3] = cleaner.getJoinedYearMonth(cols[4])
+                self.userMatrix[i, 4] = cleaner.getCountryId(cols[5])
+                self.userMatrix[i, 5] = cleaner.getTimeZoneInt(cols[6])
+            fin.close()
+            # 归一化用户矩阵
+            self.userMatrix = normalize(self.userMatrix,norm="l1", axis=0, copy=False)
+            sio.mmwrite("US_userMatrix", self.userMatrix)
+            # 计算用户相似度矩阵
+            self.userSimMatrix = ss.dok_matrix((nusers,nusers))
+            for i in range(0, nusers):
+                self.userSimMatrix[i, i] = 1.0
+            for u1, u2 in programEntities.uniqueUserPairs:
+                i = programEntities.userIndex[u1]
+                j = programEntities.userIndex[u2]
+                if not self.userSimMatrix.has_key((i, j)):
+                    usim = sim(self.userMatrix.getrow(i).todense(),
+                               self.userMatrix.getrow(j).todense())
+                    self.userSimMatrix[i, j] = usim
+                    self.userSimMatrix[j, i] = usim
+            sio.mmwrite("US_userSimMatrix", self.userSimMatrix)
+
+"""
+4.用户社交关系挖掘
+（1）numFriends shape[1,len(users)]朋友越多说明该用户性格外向
+（2）userFriends:dok_matrix shape[len(users),len(users)]
+ 第i个user的第j个朋友活跃程度，用户朋友活跃说明一定程度上说明用户活跃
+"""
+class UserFriends:
+    def __init__(self, programEntities):
+        nusers = len(programEntities.userIndex.keys())
+        self.numFriends = np.zeros((nusers))
+        self.userFriends = ss.dok_matrix((nusers, nusers))
+        fin = open("user_friends.csv", 'rb')
+        fin.readline()
+        ln = 0
+        for line in fin:
+            if ln % 200 ==0:
+                print("loading line: " + str(ln))
+            cols = line.decode('utf-8').strip().split(",")
+            user = cols[0]
+            if user in programEntities.userIndex:
+            # if programEntities.userIndex.has_key(user):
+                friends = cols[1].split(" ")
+                i = programEntities.userIndex[user]
+                self.numFriends[i] = len(friends)
+                for friend in friends:
+                    if friend in programEntities.userIndex:
+                    # if programEntities.userIndex.has_key(friend):
+                        j = programEntities.userIndex[friend]
+                        #把训练集中user/events得分相加
+                        eventsForUser = programEntities.userEventScores.getrow(j).todense()
+                        score = eventsForUser.sum() / np.shape(eventsForUser)[1]
+                        self.userFriends[i, j] += score
+                        self.userFriends[j, i] += score
+            ln += 1
+        fin.close()
+        ##归一化数组
+        sumNumFriends = self.numFriends.sum(axis=0)
+        self.numFriends = self.numFriends / sumNumFriends
+        sio.mmwrite("UF_numFriends", np.matrix(self.numFriends))
+        self.userFriends = normalize(self.userFriends, norm="l1", axis=0, copy=False)
+        sio.mmwrite("UF_userFriends", self.userFriends)
+
+"""
+5.构造event之间的相似度数据
+（1)eventPropMatrix shape[len(events),7]
+将events表中除去event内容已经id信息剩余部分
+（2)eventContMatrix： dok_matrix shape[len(events),100]
+events表中剩余的100列内容信息 count_N是最常见词出现次数 count_other其余词计数
+（3）eventPropSim doc_matrix shape[len(events),len(events)]
+event相似度矩阵
+（4）eventContSim： dok_matrix shape[len(events),len(events)]
+根据event本身计算uniqueEventPairs每两个event的相似度
+#基于邻域以及内容计算出的event-event相似度
+"""
+class Events:
+
+    def __init__(self,programEntities, psim=ssd.correlation, csim=ssd.cosine):
+        cleaner = DataCleaner()
+        fin = open("events.csv", 'rb')
+        fin.readline()
+        nevents = len(programEntities.eventIndex.keys())
+        self.eventPropMatrix = ss.dok_matrix((nevents, 7))
+        self.eventContMatrix = ss.dok_matrix((nevents, 100))
+        ln = 0
+        for line in fin.readlines():
+            # if ln % 400 == 0:
+            #     print("已经生成第%i行eventProMatrix: ", str(ln))
+            cols = line.decode('utf-8').strip().split(",")
+            eventId = cols[0]
+            if eventId in programEntities.eventIndex:
+            # if programEntities.eventIndex.has_key(eventId):
+                i = programEntities.eventIndex[eventId]
+                self.eventPropMatrix[i, 0] = cleaner.getJoinedYearMonth(cols[2]) # start_tiime
+                self.eventPropMatrix[i, 1] = cleaner.getFeatureHash(cols[3]) #city
+                self.eventPropMatrix[i, 2] = cleaner.getFeatureHash(cols[4]) #state
+                self.eventPropMatrix[i, 3] = cleaner.getFeatureHash(cols[5]) #zip
+                self.eventPropMatrix[i, 4] = cleaner.getFeatureHash(cols[6]) #country
+                self.eventPropMatrix[i, 5] = cleaner.getFloatValue(cols[7]) #lat
+                self.eventPropMatrix[i, 6] = cleaner.getFloatValue(cols[8]) #lon
+                for j in range(9,100):
+                    self.eventContMatrix[i,j-9] = cols[j]
+                # ln += 1
+        fin.close()
+        self.eventPropMatrix = normalize(self.eventPropMatrix,
+                                        norm="l1", axis=0, copy=False)
+        sio.mmwrite("EV_eventProMatrix",self.eventPropMatrix)
+        self.eventContMatrix = normalize(self.eventContMatrix,
+                                         norm="l1", axis=0, copy=False)
+        sio.mmwrite("EV_eventContMatrix", self.eventContMatrix)
+        # 开始计算events pair相似度基于这两个矩阵
+        self.eventPropSim = ss.dok_matrix((nevents, nevents))
+        self.eventContSim = ss.dok_matrix((nevents, nevents))
+        ln = 0
+        for e1, e2 in programEntities.uniqueEventPairs:#加了异常处理try except 和进度说明
+            if ln % 1000 == 0:
+                print('已经处理:',str(ln))
+            try:
+                i = programEntities.eventIndex[e1]
+                j = programEntities.eventIndex[e2]
+                if (i,j) not in self.eventPropSim:
+                # if not self.eventPropSim.has_key((i,j)):#todense()返回一个矩阵
+                #     print(self.eventPropMatrix.getrow(i))
+                #     print(self.eventPropMatrix.getrow(j))
+                    epsim = psim(self.eventPropMatrix.getrow(i).todense(),
+                                 self.eventPropMatrix.getrow(j).todense())
+                    self.eventPropSim[i, j] = epsim
+                    self.eventPropSim[j, i] = epsim
+                if (i,j) not in self.eventContSim:
+                # if not self.eventContMatrix.has_key((i,j)):
+                    ecsim = csim(self.eventContMatrix.getrow(i).todense(),
+                                 self.eventContMatrix.getrow(j).todense())
+                    self.eventContSim[i, j] = ecsim
+                    self.eventContSim[j, i] = ecsim
+                    print(ecsim)
+            except KeyError:
+                continue
+            ln += 1
+        sio.mmwrite("EV_eventPropSim", self.eventPropSim)
+        sio.mmwrite("EV_eventContSim", self.eventContSim)
+
+"""
+6.活跃度/event热度 数据
+evenetPopularity: dok_matrix shape([len(events),1)]
+将event表中yes no数据作为event的活跃度
+"""
+class EventAttendees():
+    """
+    统计某个活动参加和不参加的人数
+    """
+    def __init__(self,programEvents):
+        nevents = len(programEvents.eventIndex.keys())
+        self.eventPopularity = ss.dok_matrix((nevents, 1))
+        f = open("event_attendees.csv", 'rb')
+        f.readline()
+        for line in f:
+            cols = line.decode('utf-8').strip().split(",")
+            eventId = cols[0]
+            if eventId in programEvents.eventIndex:
+            # if programEvents.eventIndex.has_keys(eventId):
+                i = programEvents.eventIndex[eventId]
+                self.eventPopularity[i, 0]= \
+                len(cols[1].split(" ")) - len(cols[4].split(" ")) + 0.5*len(cols[2].split(" "))
+        f.close()
+        self.eventPopularity = normalize(self.eventPopularity, norm="l1",
+                                         axis=0, copy=False)
+        sio.mmwrite("EA_eventPopularity", self.eventPopularity)
+
+##7.串起所有数据和准备流程
+"""
+计算所有生成的数据，用矩阵或其他形式储存后续方便提取特征或建模
+"""
+def data_prepare():
+    print("第1步：统计user和event相关信息...")
+    pe = ProgramEntities()
+    print("第1步完成..."+'\n')
+    print("第2步：计算用户相似度信息，并用矩阵形式储存...")
+    Users(pe)
+    print("第2步完成..."+'/n')
+    print("第3步：计算用户社交关系信息并储存...")
+    UserFriends(pe)
+    print("第3步完成..."+'/n')
+    print("第4步：计算event相似度信息，并用矩阵形式储存...")
+    Events(pe)
+    print("第4步完成..."+'/n')
+    print("第5步：计算event热度信息...")
+    EventAttendees(pe)
+    print("第5步完成"+'/n')
+
+# 运行数据准备
+data_prepare()
+
+
+
+
