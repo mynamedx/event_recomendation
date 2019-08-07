@@ -1,0 +1,80 @@
+"""
+9.建模与预测
+使用了sklearn中SDGClassifier 使用了10折交叉验证
+"""
+from __future__ import division
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import KFold
+from sklearn.linear_model import SGDClassifier
+from sklearn.ensemble import GradientBoostingClassifier
+
+def train():
+    """
+    在我们得到的特征上训练分类器，target为1，或者为0
+    """
+    trainDf = pd.read_csv("data_train.csv")
+    trainDf.fillna(0,inplace=True)
+    X = np.matrix(pd.DataFrame(trainDf, index=None,
+                               columns=["invited","user_reco",
+                                        "evt_p_reco","evt_c_reco",
+                                        "user_pop","frnd_infl","evt_pop"]))# evt_c_reco存在nan 用str(x)=='nan'在生成训练集数据时进行判断
+    y = np.array(trainDf.interested)
+    clf1 = SGDClassifier(loss="log",penalty="l2")
+    clf1.fit(X, y)
+
+    clf2 = GradientBoostingClassifier(n_estimators=3000, learning_rate=0.1)
+    clf2.fit(X,y)
+    # print(clf)
+
+
+    return clf1, clf2
+
+def validate():
+    #十折交叉验证
+    trainDf = pd.read_csv("data_train.csv")
+    trainDf.fillna(0, inplace=True)
+    X = np.matrix(pd.DataFrame(trainDf, index=None,
+                                columns=['invited','iser_reco',
+                                         'evt_p_reeco','evt_c_reco',
+                                         'user_pop','frnd_infl','evt_pop']))
+    X[np.isnan(X)] = 0
+    y = np.array(trainDf.interested)
+    kfold = KFold(n_splits=10)
+    avgAccuracy = 0
+    run = 0
+    for train, test in kfold.split(X):
+        Xtrain, Xtest, ytrain, ytest = X[train], X[test], y[train], y[test]
+        clf1 = SGDClassifier(loss="log", penalty="l2")
+        clf1.fit(Xtrain, ytrain)
+        accuracy = 0
+        ntest = len(ytest)
+        for i in range(0, ntest):
+            yt = clf1.predict(Xtest[i, :])
+            if yt == ytest[i]:
+                accuracy += 1
+        accuracy = accuracy / ntest
+        print("accuracy (run %d): %f" % (run, accuracy))
+        avgAccuracy += accuracy
+        run += 1
+    print("SDG's Average accuracy", (avgAccuracy / run))
+
+    for train, test in kfold.split(X):
+        Xtrain, Xtest, ytrain, ytest = X[train], X[test], y[train], y[test]
+        clf2 = GradientBoostingClassifier(n_estimators=3000, learning_rate=0.1)
+        clf2.fit(X, y)
+        accuracy = 0
+        ntest = len(ytest)
+        for i in range(0, ntest):
+            yt = clf2.predict(Xtest[i, :])
+            if yt == ytest[i]:
+                accuracy += 1
+        accuracy = accuracy / ntest
+        print("accuracy (run %d): %f" % (run, accuracy))
+        avgAccuracy += accuracy
+        run += 1
+    print("GBDT's Average accuracy", (avgAccuracy / run))
+
+train()
+validate()
+
